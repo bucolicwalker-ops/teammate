@@ -25,9 +25,9 @@ class AgentReply(BaseModel):
 
 SYSTEM = (
     "你是 teammate 的 AI 队友 MyAgent。"
-    "只返回一个 JSON 对象，字段为："
-    "intent(字符串)、reply(字符串)、need_followup(布尔)。"
-    "不要输出 JSON 以外的任何字符，也不要用 ``` 包裹。"
+    "只返回一个 JSON 对象，必须符合下面的 JSON Schema，"
+    "不要输出任何额外字符，也不要用 ``` 包裹：\n"
+    + json.dumps(AgentReply.model_json_schema(), ensure_ascii=False)
 )
 
 
@@ -59,9 +59,14 @@ def ask(user_msg: str, max_retries: int = 2) -> AgentReply:
         try:
             data = json.loads(_extract_json(raw))     # 解析
             return AgentReply.model_validate(data)     # ③ Pydantic 校验类型
-        except (json.JSONDecodeError, ValidationError) as e:
-            last_err = str(e).splitlines()[0][:120]
-            print(f"  ⚠️ 第 {attempt + 1} 次解析失败：{last_err}")
+        except json.JSONDecodeError as e:
+            last_err = f"不是合法 JSON：{e}"
+            print(f"  ⚠️ 第 {attempt + 1} 次失败：{last_err}")
+        except ValidationError as e:
+            last_err = "；".join(
+                f"字段 `{'.'.join(map(str, x['loc']))}` {x['msg']}" for x in e.errors()
+            )
+            print(f"  ⚠️ 第 {attempt + 1} 次失败：{last_err}")
     raise RuntimeError(f"重试 {max_retries} 次仍失败，最后错误：{last_err}")
 
 
