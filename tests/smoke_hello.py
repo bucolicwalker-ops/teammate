@@ -1,7 +1,7 @@
 """teammate · L0 smoke test —— 让你的第一个 teammate(MyAgent) 说话。
 
 走 DashScope 的 Anthropic 兼容端点 + 智谱 GLM（你的 key 走的就是这条路）。
-跑法：python hello.py（依赖已装在 .venv）。
+跑法：.venv/bin/python tests/smoke_hello.py（从 teammate/ 根目录跑）。
 """
 import os
 from anthropic import Anthropic
