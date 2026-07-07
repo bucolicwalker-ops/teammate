@@ -1,5 +1,5 @@
-"""teammate · L1 W3 —— MyAgent 带短期记忆版（conversation history）。
-W1 做了结构化输出；W2 加工具调用循环；W3 把 ask() 重构为 MyAgent class，加 self.history。
+"""teammate · L2 W4 —— MyAgent 带 RAG 知识库。
+W1 结构化输出；W2 工具循环；W3 短期+长期记忆；W4 RAG 知识库检索。
 跑法：.venv/bin/python -m src.agent   （从 teammate/ 根目录跑）
 """
 import os
@@ -8,6 +8,7 @@ import operator
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from src.memory import VectorMemory
+from src.rag import KnowledgeBase
 
 load_dotenv()
 client = Anthropic(
@@ -137,10 +138,20 @@ class MyAgent:
     """
 
     def __init__(self, max_history: int = 20, use_long_term: bool = True,
-                 memory_path: str = "data/memory.json"):
+                 memory_path: str = "data/memory.json",
+                 embed_endpoint: str | None = None,
+                 use_knowledge: bool = False,
+                 knowledge_path: str = "data/knowledge.json"):
         self.history: list[dict] = []
         self.max_history = max_history
-        self.memory = VectorMemory(memory_path) if use_long_term else None
+        self.memory = VectorMemory(memory_path, embed_endpoint) if use_long_term else None
+        self.knowledge = KnowledgeBase(knowledge_path, embed_endpoint) if use_knowledge else None
+
+    def load_knowledge(self, file_path: str, chunk_size: int = 500, overlap: int = 50):
+        """加载文档到知识库（RAG 语料）。"""
+        if self.knowledge:
+            return self.knowledge.load_document(file_path, chunk_size, overlap)
+        return 0
 
     def ask(self, user_msg: str, max_steps: int = 5) -> str:
         """多工具 Agent 主循环（带短期 + 长期记忆）。
@@ -151,7 +162,14 @@ class MyAgent:
         recalled = []
         if self.memory:
             recalled = self.memory.retrieve(user_msg, top_k=3)
-        system = SYSTEM + (self.memory.format_context(recalled) if recalled else "")
+        kb_chunks = []
+        if self.knowledge:
+            kb_chunks = self.knowledge.retrieve(user_msg, top_k=3)
+        system = SYSTEM
+        if recalled:
+            system += self.memory.format_context(recalled)
+        if kb_chunks:
+            system += self.knowledge.format_context(kb_chunks)
 
         self.history.append({"role": "user", "content": user_msg})
         self._truncate()
@@ -241,6 +259,23 @@ if __name__ == "__main__":
         print("D-6 长期记忆验证：跨 session recall")
         print("=" * 60)
         for msg in ["我叫什么名字？", "我住在哪里？"]:
+            print(f"\n{'─' * 60}")
+            print(f"用户: {msg}")
+            print(f"{'─' * 60}")
+            reply = agent.ask(msg)
+            print(f"\nMyAgent: {reply}")
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "rag":
+        # W4 验证：RAG 知识库——加载文档→检索→注入→生成
+        agent = MyAgent(max_history=20, use_knowledge=True)
+        agent.load_knowledge("/Users/bobk/Desktop/AgentPlan/bagu/面试题库.md")
+        print("=" * 60)
+        print("W4 RAG 验证：知识库问答")
+        print("=" * 60)
+        for msg in [
+            "面试问我agent记忆系统怎么实现，我怎么答？",
+            "上下文压缩怎么做？",
+        ]:
             print(f"\n{'─' * 60}")
             print(f"用户: {msg}")
             print(f"{'─' * 60}")
