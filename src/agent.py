@@ -1,5 +1,5 @@
-"""teammate · L0 W2 —— MyAgent 多工具版（Function Calling）。
-W1 做了结构化输出；W2 加工具调用循环，让 MyAgent 能"动手"。
+"""teammate · L1 W3 —— MyAgent 带短期记忆版（conversation history）。
+W1 做了结构化输出；W2 加工具调用循环；W3 把 ask() 重构为 MyAgent class，加 self.history。
 跑法：.venv/bin/python -m src.agent   （从 teammate/ 根目录跑）
 """
 import os
@@ -7,6 +7,7 @@ import ast
 import operator
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from src.memory import VectorMemory
 
 load_dotenv()
 client = Anthropic(
@@ -23,7 +24,7 @@ SYSTEM = (
 
 
 # ============================================================
-# ① 工具实现 + 注册表
+# ① 工具实现 + 注册表（W2 不变）
 # ============================================================
 
 def get_weather(city: str) -> str:
@@ -69,8 +70,6 @@ def calc(expression: str) -> str:
     return str(_eval(tree.body))
 
 
-# 工具注册表：name → {fn, description, schema}
-# 这就是给 LLM 看的"工具菜单"——它根据 description 判断要不要调
 TOOL_REGISTRY = {
     "get_weather": {
         "fn": get_weather,
@@ -107,7 +106,6 @@ TOOL_REGISTRY = {
     },
 }
 
-# 转成 Anthropic SDK 的 tools 参数格式
 TOOLS = [
     {"name": name, "description": cfg["description"], "input_schema": cfg["schema"]}
     for name, cfg in TOOL_REGISTRY.items()
@@ -126,58 +124,107 @@ def execute_tool(name: str, args: dict) -> str:
 
 
 # ============================================================
-# ② Agent 调用循环（Function Calling 的核心）
+# ② MyAgent class（W3 新增：短期记忆）
 # ============================================================
 
-def ask(user_msg: str, max_steps: int = 5) -> str:
-    """多工具 Agent 主循环。
+class MyAgent:
+    """带短期 + 长期记忆的 Agent。
 
-    每轮：
-      1. 把对话发给 LLM（带工具列表）
-      2. LLM 要么调工具（tool_use），要么直接回答（text）
-      3. 如果调工具 → 执行 → 结果回填 → 回到 1
-      4. 如果直接回答 → 返回
-      5. max_steps 兜底：超过 N 轮还没完就中止（防死循环）
+    短期：self.history（内存 list，session 内跨轮存活）。
+    长期：self.memory（VectorMemory，跨 session 持久化 + 语义召回）。
+
+    W2 的 ask() 是 stateless function；W3 重构为 class。
     """
-    messages = [{"role": "user", "content": user_msg}]
 
-    for step in range(max_steps):
-        print(f"\n  ── 第 {step + 1} 轮 ──")
-        resp = client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=SYSTEM,
-            tools=TOOLS,
-            messages=messages,
-        )
-        print(f"  stop_reason: {resp.stop_reason}")
+    def __init__(self, max_history: int = 20, use_long_term: bool = True,
+                 memory_path: str = "data/memory.json"):
+        self.history: list[dict] = []
+        self.max_history = max_history
+        self.memory = VectorMemory(memory_path) if use_long_term else None
 
-        # 检查 LLM 输出里有没有 tool_use
-        tool_calls = [b for b in resp.content if b.type == "tool_use"]
-        texts = [b for b in resp.content if b.type == "text"]
+    def ask(self, user_msg: str, max_steps: int = 5) -> str:
+        """多工具 Agent 主循环（带短期 + 长期记忆）。
 
-        if not tool_calls:
-            # 没有工具调用 = 模型给出了最终回答
-            final = "".join(b.text for b in texts)
-            print(f"  ✅ 完成（共 {step + 1} 轮）")
-            return final
+        短期：self.history 跨调用存活。
+        长期：ask 前 retrieve 相关记忆注入 system；ask 后存对话到向量库。
+        """
+        recalled = []
+        if self.memory:
+            recalled = self.memory.retrieve(user_msg, top_k=3)
+        system = SYSTEM + (self.memory.format_context(recalled) if recalled else "")
 
-        # 有工具调用 → 执行所有 tool_use → 收集结果
-        messages.append({"role": "assistant", "content": resp.content})
-        tool_results = []
-        for tc in tool_calls:
-            print(f"  调工具: {tc.name}({tc.input})")
-            result = execute_tool(tc.name, tc.input)
-            print(f"  结果: {result}")
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tc.id,
-                "content": result,
-            })
-        # 把工具结果作为 user 消息回填
-        messages.append({"role": "user", "content": tool_results})
+        self.history.append({"role": "user", "content": user_msg})
+        self._truncate()
 
-    return f"⚠️ 超过 {max_steps} 轮仍未完成，已中止（可能死循环）。"
+        for step in range(max_steps):
+            print(f"\n  ── 第 {step + 1} 轮 ──")
+            try:
+                resp = client.messages.create(
+                    model=MODEL,
+                    max_tokens=1024,
+                    system=system,
+                    tools=TOOLS,
+                    messages=self.history,
+                )
+            except Exception as e:
+                err = f"⚠️ LLM 调用失败（{type(e).__name__}），已中止: {e}"
+                self.history.append({"role": "assistant", "content": err})
+                if self.memory:
+                    self.memory.add(f"用户: {user_msg}\nMyAgent: {err}")
+                return err
+            print(f"  stop_reason: {resp.stop_reason}")
+
+            tool_calls = [b for b in resp.content if b.type == "tool_use"]
+            texts = [b for b in resp.content if b.type == "text"]
+
+            if not tool_calls:
+                final = "".join(b.text for b in texts)
+                self.history.append({"role": "assistant", "content": final})
+                if self.memory:
+                    self.memory.add(f"用户: {user_msg}\nMyAgent: {final}")
+                print(f"  ✅ 完成（共 {step + 1} 轮）")
+                return final
+
+            self.history.append({"role": "assistant", "content": resp.content})
+            tool_results = []
+            for tc in tool_calls:
+                print(f"  调工具: {tc.name}({tc.input})")
+                result = execute_tool(tc.name, tc.input)
+                print(f"  结果: {result}")
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc.id,
+                    "content": result,
+                })
+            self.history.append({"role": "user", "content": tool_results})
+
+        fallback = f"⚠️ 超过 {max_steps} 轮仍未完成，已中止（可能死循环）。"
+        self.history.append({"role": "assistant", "content": fallback})
+        if self.memory:
+            self.memory.add(f"用户: {user_msg}\nMyAgent: {fallback}")
+        return fallback
+
+    def _truncate(self):
+        """截断策略：保留最近 max_history 条，但确保不破坏 user/assistant 配对。
+
+        盲切片会从 turn 中间断开——首条可能是 assistant 或 tool_result，
+        API 要求 messages 必须以 proper user 消息开头且交替配对。
+        修复：切片后从头部丢弃不完整的消息，直到首条是 user + string content。
+        注意：清理后实际条数可能少于 max_history（连带丢了完整 turn 的碎片）。
+
+        面试深挖点：按轮截断（turn-aware）比按消息截断更干净——
+        不会连带丢配对；摘要压缩（用 LLM summarize 老对话）；
+        混合（老对话 summarize + 近 N 轮保留原文）。
+        """
+        if len(self.history) <= self.max_history:
+            return
+        self.history = self.history[-self.max_history:]
+        while self.history:
+            first = self.history[0]
+            if first["role"] == "user" and isinstance(first["content"], str):
+                break
+            self.history.pop(0)
+        print(f"  📝 历史截断：保留最近 {len(self.history)} 条消息")
 
 
 # ============================================================
@@ -185,15 +232,43 @@ def ask(user_msg: str, max_steps: int = 5) -> str:
 # ============================================================
 
 if __name__ == "__main__":
-    test_cases = [
-        "北京天气怎么样？",
-        "帮我算一下 (15 + 27) * 3 等于多少",
-        "北京和上海哪个温度更高？高多少度？",
-        "什么是 RAG？",
-    ]
-    for msg in test_cases:
-        print(f"\n{'='*60}")
-        print(f"用户: {msg}")
-        print(f"{'='*60}")
-        reply = ask(msg)
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "session2":
+        # D-6 验证：长期记忆——新 session（新 MyAgent 实例），能不能 recall 上个 session 的记忆
+        agent = MyAgent(max_history=20)
+        print("=" * 60)
+        print("D-6 长期记忆验证：跨 session recall")
+        print("=" * 60)
+        for msg in ["我叫什么名字？", "我住在哪里？"]:
+            print(f"\n{'─' * 60}")
+            print(f"用户: {msg}")
+            print(f"{'─' * 60}")
+            reply = agent.ask(msg)
+            print(f"\nMyAgent: {reply}")
+
+    else:
+        # D-5 验证：短期记忆——多轮对话能接住上下文
+        agent = MyAgent(max_history=20)
+        conversations = [
+            "北京天气怎么样？",
+            "那上海呢？",
+            "两个城市哪个更热？高多少？",
+        ]
+        print("=" * 60)
+        print("D-5 短期记忆验证：多轮对话")
+        print("=" * 60)
+        for msg in conversations:
+            print(f"\n{'─' * 60}")
+            print(f"用户: {msg}")
+            print(f"{'─' * 60}")
+            reply = agent.ask(msg)
+            print(f"\nMyAgent: {reply}")
+
+        # D-6 种子：存一条跨 session 应该记住的事实
+        print(f"\n{'=' * 60}")
+        print("D-6 种子：存一条记忆供下个 session recall")
+        print(f"{'=' * 60}")
+        reply = agent.ask("记住：我叫小明，我住在北京。")
         print(f"\nMyAgent: {reply}")
+        print(f"\n→ 现在运行 `.venv/bin/python -m src.agent session2` 验证跨 session recall")

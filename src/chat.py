@@ -1,10 +1,12 @@
 """teammate · 和 MyAgent 对话——在终端里试一试。
 跑法：.venv/bin/python -m src.chat   （从 teammate/ 根目录跑，输入 exit 退出）
 
-注意：现在 MyAgent 还没有记忆，每句话都是独立处理的——
-它不记得你上一句说了啥。这正是 W3「记忆」要解决的，你试的时候能明显感觉到。
+W3 更新：MyAgent 现在有短期记忆了——连续对话能接住上下文。
+试试："北京天气" → "那上海呢" → "哪个更热" → 看它能不能接住。
 """
-from src.agent import ask
+from src.agent import MyAgent
+
+agent = MyAgent(max_history=20)
 
 print("=== 和 MyAgent 聊天（输入 exit 退出）===\n")
 while True:
@@ -15,7 +17,7 @@ while True:
     if msg in ("exit", "quit", ""):
         break
     try:
-        reply = ask(msg)
+        reply = agent.ask(msg)
         print(f"\nMyAgent: {reply}\n")
     except Exception as e:
         print(f"   ⚠️ 出错了: {e}\n")

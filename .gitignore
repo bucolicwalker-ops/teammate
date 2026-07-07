@@ -1,6 +1,7 @@
 # teammate · gitignore
 .venv/
 .env
+data/
 __pycache__/
 *.pyc
 chroma/
