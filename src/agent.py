@@ -230,7 +230,7 @@ class MyAgent:
         修复：切片后从头部丢弃不完整的消息，直到首条是 user + string content。
         注意：清理后实际条数可能少于 max_history（连带丢了完整 turn 的碎片）。
 
-        面试深挖点：按轮截断（turn-aware）比按消息截断更干净——
+        进阶：按轮截断（turn-aware）比按消息截断更干净——
         不会连带丢配对；摘要压缩（用 LLM summarize 老对话）；
         混合（老对话 summarize + 近 N 轮保留原文）。
         """
@@ -268,12 +268,12 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "rag":
         # W4 验证：RAG 知识库——加载文档→检索→注入→生成
         agent = MyAgent(max_history=20, use_knowledge=True)
-        agent.load_knowledge("/Users/bobk/Desktop/AgentPlan/bagu/面试题库.md")
+        agent.load_knowledge("../bagu/qbank.md")
         print("=" * 60)
         print("W4 RAG 验证：知识库问答")
         print("=" * 60)
         for msg in [
-            "面试问我agent记忆系统怎么实现，我怎么答？",
+            "agent记忆系统怎么实现？",
             "上下文压缩怎么做？",
         ]:
             print(f"\n{'─' * 60}")

@@ -104,7 +104,7 @@ class KnowledgeBase:
 
     @staticmethod
     def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
-        """固定大小切块 + overlap。深挖版：语义切块（见 _chunk_by_headers）。"""
+        """固定大小切块 + overlap。进阶：语义切块（见 _chunk_by_headers）。"""
         if not text:
             return []
         chunks = []
