@@ -4,6 +4,7 @@ W1 结构化输出；W2 工具循环；W3 短期+长期记忆；W4 RAG 知识库
 """
 import os
 import ast
+import json
 import operator
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ client = Anthropic(
 )
 MODEL = os.getenv("MODEL", "glm-5.2")
 
-SYSTEM = (
+DEFAULT_SYSTEM = (
     "你是 teammate 的 AI 队友 MyAgent。"
     "你可以调用工具来获取信息或执行计算。"
     "需要时先调工具，拿到结果后再给出回复。"
@@ -141,9 +142,11 @@ class MyAgent:
                  memory_path: str = "data/memory.json",
                  embed_endpoint: str | None = None,
                  use_knowledge: bool = False,
-                 knowledge_path: str = "data/knowledge.json"):
+                 knowledge_path: str = "data/knowledge.json",
+                 system: str | None = None):
         self.history: list[dict] = []
         self.max_history = max_history
+        self.system = system or DEFAULT_SYSTEM
         self.memory = VectorMemory(memory_path, embed_endpoint) if use_long_term else None
         self.knowledge = KnowledgeBase(knowledge_path, embed_endpoint) if use_knowledge else None
 
@@ -165,7 +168,7 @@ class MyAgent:
         kb_chunks = []
         if self.knowledge:
             kb_chunks = self.knowledge.retrieve(user_msg, top_k=3)
-        system = SYSTEM
+        system = self.system
         if recalled:
             system += self.memory.format_context(recalled)
         if kb_chunks:
@@ -244,6 +247,61 @@ class MyAgent:
             self.history.pop(0)
         print(f"  📝 历史截断：保留最近 {len(self.history)} 条消息")
 
+    def plan_and_execute(self, user_msg: str, max_steps: int = 8) -> str:
+        """Plan-Execute：先规划全部步骤，再逐步执行，最后汇总。
+
+        和 ReAct（ask）的区别：ReAct 走一步看一步，Plan-Execute 先全局规划再执行。
+        适合步骤多、依赖关系复杂的任务（如"帮我做三日游攻略"）。
+        每个步骤用 ReAct（ask）执行——Plan-Execute 是 ReAct 的上层包装，不是替换。
+        """
+        print(f"  📋 Plan 阶段：生成执行计划...")
+        plan_resp = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system="你是规划者。拆解任务为可执行的步骤。返回 JSON。只返回 JSON。",
+            messages=[{"role": "user", "content": (
+                f"分析以下任务，拆解成具体可执行的步骤（每步一个子任务）。\n"
+                f"任务: {user_msg}\n\n"
+                f'返回 JSON: {{"steps": ["步骤1", "步骤2", ...]}}'
+            )}],
+        )
+        plan_text = "".join(b.text for b in plan_resp.content if b.type == "text").strip()
+        if "```" in plan_text:
+            plan_text = plan_text.split("```")[1]
+            if plan_text.startswith("json"):
+                plan_text = plan_text[4:]
+        try:
+            steps = json.loads(plan_text)["steps"]
+        except json.JSONDecodeError:
+            return f"规划失败，直接回答：\n{self.ask(user_msg)}"
+
+        print(f"  📋 计划：{len(steps)} 步")
+        for i, s in enumerate(steps):
+            print(f"     {i+1}. {s}")
+
+        # Execute：每步用 ReAct 执行
+        results = []
+        self.history.clear()
+        for i, step in enumerate(steps):
+            print(f"\n  🔨 Execute 步骤 {i+1}/{len(steps)}: {step}")
+            result = self.ask(step)
+            results.append(f"步骤{i+1}（{step}）: {result}")
+
+        # Summarize：汇总所有步骤结果
+        print(f"\n  📝 Summarize 阶段：汇总结果...")
+        summary_resp = client.messages.create(
+            model=MODEL,
+            max_tokens=2048,
+            system=self.system,
+            messages=[{"role": "user", "content": (
+                f"基于以下执行结果，回答用户的原始问题。\n"
+                f"原始问题: {user_msg}\n\n"
+                f"执行结果:\n" + "\n\n".join(results)
+            )}],
+        )
+        final = "".join(b.text for b in summary_resp.content if b.type == "text")
+        return final
+
 
 # ============================================================
 # ③ 入口
@@ -264,6 +322,21 @@ if __name__ == "__main__":
             print(f"{'─' * 60}")
             reply = agent.ask(msg)
             print(f"\nMyAgent: {reply}")
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "plan":
+        # W6 验证：Plan-Execute——先规划再执行
+        agent = MyAgent(max_history=20, use_knowledge=True)
+        agent.load_knowledge("../bagu/qbank.md")
+        print("=" * 60)
+        print("W6 Plan-Execute 验证")
+        print("=" * 60)
+        task = "帮我查一下北京和上海的天气，算出温差，再解释哪个城市更热"
+        print(f"\n任务: {task}")
+        reply = agent.plan_and_execute(task)
+        print(f"\n{'=' * 60}")
+        print(f"最终结果:")
+        print(f"{'=' * 60}")
+        print(reply)
 
     elif len(sys.argv) > 1 and sys.argv[1] == "rag":
         # W4 验证：RAG 知识库——加载文档→检索→注入→生成
