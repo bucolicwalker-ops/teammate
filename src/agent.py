@@ -5,7 +5,7 @@ W1 结构化输出；W2 工具循环；W3 短期+长期记忆；W4 RAG 知识库
 import os
 import ast
 import json
-import signal
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import subprocess
 import sys
 import threading
@@ -179,21 +179,19 @@ def execute_tool(name: str, args: dict) -> str:
 
 
 def _call_with_timeout(fn, args: dict, timeout: int):
-    """用 SIGALRM 实现工具调用的超时控制（Unix only，macOS/Linux）。
+    """用 ThreadPoolExecutor 实现工具调用的超时控制。
 
-    timeout 后抛 TimeoutError。注意：SIGALRM 只在主线程有效，
-    多线程环境需要用 concurrent.futures.ThreadPoolExecutor 替代。
+    跨线程安全（不像 SIGALRM 只在主线程有效）。
+    uvicorn 线程池里也能用——W8 服务化暴露的 W7 bug 修复。
+    注意：超时后线程不会被杀（Python 限制），继续后台跑，
+    但调用方会拿到 TimeoutError——学习项目够用。
     """
-    def _handler(signum, frame):
-        raise TimeoutError(f"工具执行超时（{timeout}秒）")
-
-    old_handler = signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(timeout)
-    try:
-        return fn(**args)
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(fn, **args)
+        try:
+            return future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            raise TimeoutError(f"工具执行超时（{timeout}秒）")
 
 
 # ============================================================
@@ -247,16 +245,13 @@ class MCPClient:
         self.proc.stdin.flush()
         if "id" not in req:
             return {}
-        # readline with timeout（防 server 崩溃 hang）
-        def _handler(signum, frame):
-            raise TimeoutError("MCP server 响应超时")
-        old = signal.signal(signal.SIGALRM, _handler)
-        signal.alarm(TOOL_TIMEOUT + 5)
-        try:
-            line = self.proc.stdout.readline()
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old)
+        # readline with timeout（跨线程安全，不用 SIGALRM）
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self.proc.stdout.readline)
+            try:
+                line = future.result(timeout=TOOL_TIMEOUT + 5)
+            except FuturesTimeoutError:
+                raise TimeoutError("MCP server 响应超时")
         if not line:
             raise TimeoutError("MCP server 无响应（可能已崩溃）")
         return json.loads(line)
