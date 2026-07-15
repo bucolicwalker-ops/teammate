@@ -8,11 +8,14 @@ import json
 import signal
 import subprocess
 import sys
+import threading
+import time
 import operator
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from src.memory import VectorMemory
 from src.rag import KnowledgeBase
+from src.trace import Tracer
 
 load_dotenv()
 client = Anthropic(
@@ -289,6 +292,8 @@ class MyAgent:
         self.memory = VectorMemory(memory_path, embed_endpoint) if use_long_term else None
         self.knowledge = KnowledgeBase(knowledge_path, embed_endpoint) if use_knowledge else None
         self.mcp_client = MCPClient() if use_mcp else None
+        self.tracer = Tracer()
+        self._lock = threading.Lock()  # 串行化 ask()——服务化并发安全
 
     def load_knowledge(self, file_path: str, chunk_size: int = 500, overlap: int = 50):
         """加载文档到知识库（RAG 语料）。"""
@@ -297,7 +302,12 @@ class MyAgent:
         return 0
 
     def ask(self, user_msg: str, max_steps: int = 5) -> str:
-        """多工具 Agent 主循环（带短期 + 长期记忆）。
+        """线程安全入口：串行化 ask——服务化并发时防 history 混 + trace 串。"""
+        with self._lock:
+            return self._ask_unlocked(user_msg, max_steps)
+
+    def _ask_unlocked(self, user_msg: str, max_steps: int = 5) -> str:
+        """多工具 Agent 主循环（带短期 + 长期记忆 + trace）。
 
         短期：self.history 跨调用存活。
         长期：ask 前 retrieve 相关记忆注入 system；ask 后存对话到向量库。
@@ -317,8 +327,11 @@ class MyAgent:
         self.history.append({"role": "user", "content": user_msg})
         self._truncate()
 
+        trace_id = self.tracer.start_trace(user_msg)
+
         for step in range(max_steps):
             print(f"\n  ── 第 {step + 1} 轮 ──")
+            t0 = time.time()
             try:
                 resp = client.messages.create(
                     model=MODEL,
@@ -332,7 +345,12 @@ class MyAgent:
                 self.history.append({"role": "assistant", "content": err})
                 if self.memory:
                     self.memory.add(f"用户: {user_msg}\nMyAgent: {err}")
+                self.tracer.finish_trace(trace_id, err)
                 return err
+            llm_latency = time.time() - t0
+            in_tok = getattr(getattr(resp, 'usage', None), 'input_tokens', 0) or 0
+            out_tok = getattr(getattr(resp, 'usage', None), 'output_tokens', 0) or 0
+            self.tracer.log_llm_call(trace_id, step + 1, in_tok, out_tok, llm_latency)
             print(f"  stop_reason: {resp.stop_reason}")
 
             tool_calls = [b for b in resp.content if b.type == "tool_use"]
@@ -343,6 +361,7 @@ class MyAgent:
                 self.history.append({"role": "assistant", "content": final})
                 if self.memory:
                     self.memory.add(f"用户: {user_msg}\nMyAgent: {final}")
+                self.tracer.finish_trace(trace_id, final)
                 print(f"  ✅ 完成（共 {step + 1} 轮）")
                 return final
 
@@ -350,10 +369,13 @@ class MyAgent:
             tool_results = []
             for tc in tool_calls:
                 print(f"  调工具: {tc.name}({tc.input})")
+                t_tool = time.time()
                 if self.mcp_client:
                     result = self.mcp_client.call_tool(tc.name, tc.input)
                 else:
                     result = execute_tool(tc.name, tc.input)
+                tool_latency = time.time() - t_tool
+                self.tracer.log_tool_call(trace_id, tc.name, tc.input, result, tool_latency)
                 print(f"  结果: {result}")
                 tool_results.append({
                     "type": "tool_result",
@@ -366,6 +388,7 @@ class MyAgent:
         self.history.append({"role": "assistant", "content": fallback})
         if self.memory:
             self.memory.add(f"用户: {user_msg}\nMyAgent: {fallback}")
+        self.tracer.finish_trace(trace_id, fallback)
         return fallback
 
     def _truncate(self):
