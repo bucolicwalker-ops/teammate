@@ -6,6 +6,8 @@ import os
 import ast
 import json
 import signal
+import subprocess
+import sys
 import operator
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -192,7 +194,63 @@ def _call_with_timeout(fn, args: dict, timeout: int):
 
 
 # ============================================================
-# ② MyAgent class（W3 新增：短期记忆）
+# ③ MCP 客户端（W7：工具标准化接入）
+# ============================================================
+
+class MCPClient:
+    """MCP 客户端：通过子进程 + JSON-RPC 调用 MCP server 的工具。
+
+    和直接函数调用（execute_tool）的区别：
+    - 直接调用：同进程，fn(**args)
+    - MCP 调用：子进程，JSON-RPC over stdio
+    两者走同一个 execute_tool（含失败处理），只是传输方式不同。
+
+    MCP 协议（JSON-RPC 2.0 over stdio）：
+    1. initialize 握手
+    2. tools/list → 返回工具 schema
+    3. tools/call → 执行工具，返回结果
+    """
+
+    def __init__(self):
+        cwd = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "src.mcp_server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+        )
+        # initialize 握手
+        self._send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        print("  🔌 MCP server 已连接")
+
+    def call_tool(self, name: str, args: dict) -> str:
+        """通过 MCP 协议调用工具。"""
+        req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": name, "arguments": args}}
+        resp = self._send(req)
+        if "error" in resp:
+            return resp["error"]["message"]
+        return resp["result"]["content"][0]["text"]
+
+    def _send(self, req: dict) -> dict:
+        """发送 JSON-RPC 请求，读响应。notification（无 id）不读响应。"""
+        self.proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+        if "id" not in req:
+            return {}
+        line = self.proc.stdout.readline()
+        return json.loads(line)
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+
+
+# ============================================================
+# ④ MyAgent class
 # ============================================================
 
 class MyAgent:
@@ -209,12 +267,14 @@ class MyAgent:
                  embed_endpoint: str | None = None,
                  use_knowledge: bool = False,
                  knowledge_path: str = "data/knowledge.json",
-                 system: str | None = None):
+                 system: str | None = None,
+                 use_mcp: bool = False):
         self.history: list[dict] = []
         self.max_history = max_history
         self.system = system or DEFAULT_SYSTEM
         self.memory = VectorMemory(memory_path, embed_endpoint) if use_long_term else None
         self.knowledge = KnowledgeBase(knowledge_path, embed_endpoint) if use_knowledge else None
+        self.mcp_client = MCPClient() if use_mcp else None
 
     def load_knowledge(self, file_path: str, chunk_size: int = 500, overlap: int = 50):
         """加载文档到知识库（RAG 语料）。"""
@@ -276,7 +336,10 @@ class MyAgent:
             tool_results = []
             for tc in tool_calls:
                 print(f"  调工具: {tc.name}({tc.input})")
-                result = execute_tool(tc.name, tc.input)
+                if self.mcp_client:
+                    result = self.mcp_client.call_tool(tc.name, tc.input)
+                else:
+                    result = execute_tool(tc.name, tc.input)
                 print(f"  结果: {result}")
                 tool_results.append({
                     "type": "tool_result",
@@ -388,6 +451,20 @@ if __name__ == "__main__":
             print(f"{'─' * 60}")
             reply = agent.ask(msg)
             print(f"\nMyAgent: {reply}")
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "mcp":
+        # W7 验证：MCP 独立进程——工具通过 MCP 协议调用（不是同进程函数）
+        agent = MyAgent(max_history=20, use_mcp=True)
+        print("=" * 60)
+        print("W7 MCP 验证：工具通过独立进程调用")
+        print("=" * 60)
+        for msg in ["读一下 requirements.txt 文件", "帮我算 15 * 3"]:
+            print(f"\n{'─' * 60}")
+            print(f"用户: {msg}")
+            print(f"{'─' * 60}")
+            reply = agent.ask(msg)
+            print(f"\nMyAgent: {reply[:100]}...")
+        agent.mcp_client.close()
 
     elif len(sys.argv) > 1 and sys.argv[1] == "tools":
         # W7 验证：真工具 + 失败处理
