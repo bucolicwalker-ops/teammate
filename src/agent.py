@@ -5,6 +5,7 @@ W1 结构化输出；W2 工具循环；W3 短期+长期记忆；W4 RAG 知识库
 import os
 import ast
 import json
+import signal
 import operator
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -72,6 +73,16 @@ def calc(expression: str) -> str:
     return str(_eval(tree.body))
 
 
+def read_file(path: str) -> str:
+    """读取文件内容（W7 真工具，不 mock）。
+
+    会撞到真实失败：FileNotFoundError / PermissionError / UnicodeDecodeError / 大文件超时。
+    限制 2000 字防止 context 爆炸。
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read(2000)
+
+
 TOOL_REGISTRY = {
     "get_weather": {
         "fn": get_weather,
@@ -106,6 +117,17 @@ TOOL_REGISTRY = {
             "required": ["expression"],
         },
     },
+    "read_file": {
+        "fn": read_file,
+        "description": "读取文件内容（限2000字）",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "文件路径，如 src/agent.py"},
+            },
+            "required": ["path"],
+        },
+    },
 }
 
 TOOLS = [
@@ -114,15 +136,59 @@ TOOLS = [
 ]
 
 
+# ============================================================
+# ② 工具执行（W7 增强：timeout + retry + 分级降级）
+# ============================================================
+
+TOOL_TIMEOUT = 10  # 秒
+MAX_RETRIES = 2
+RETRYABLE_ERRORS = (TimeoutError, ConnectionError)  # 临时性错误才重试
+# 注意：不要放 OSError——FileNotFoundError/PermissionError 是 OSError 子类，
+# 但它们是永久性错误（重试也不会变），应该走错误回灌不重试。
+
+
 def execute_tool(name: str, args: dict) -> str:
-    """执行工具，返回结果。出错时返回错误信息（不崩，把错误回灌给模型让它应对）。"""
+    """执行工具，带 timeout + retry + 分级降级。
+
+    失败处理 taxonomy（适用于所有工具，不只 read_file）：
+    1. 临时性错误（TimeoutError/ConnectionError）→ 重试 MAX_RETRIES 次
+    2. 永久性错误（FileNotFoundError/PermissionError/ValueError）→ 不重试，错误回灌
+    3. 未知错误 → 错误回灌 + 类型信息，让模型判断
+    """
     if name not in TOOL_REGISTRY:
         return f"错误：未知工具 '{name}'，可用工具：{list(TOOL_REGISTRY.keys())}"
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            result = _call_with_timeout(TOOL_REGISTRY[name]["fn"], args, TOOL_TIMEOUT)
+            return str(result)
+        except RETRYABLE_ERRORS as e:
+            if attempt < MAX_RETRIES:
+                print(f"  ⚠️ 工具 {name} 第{attempt+1}次失败（{type(e).__name__}），重试...")
+                continue
+            return f"工具 {name} 重试{MAX_RETRIES}次后仍失败：{type(e).__name__}: {e}"
+        except Exception as e:
+            return f"工具 {name} 执行出错（不可重试）：{type(e).__name__}: {e}"
+
+    return f"工具 {name} 超时且重试失败"
+
+
+def _call_with_timeout(fn, args: dict, timeout: int):
+    """用 SIGALRM 实现工具调用的超时控制（Unix only，macOS/Linux）。
+
+    timeout 后抛 TimeoutError。注意：SIGALRM 只在主线程有效，
+    多线程环境需要用 concurrent.futures.ThreadPoolExecutor 替代。
+    """
+    def _handler(signum, frame):
+        raise TimeoutError(f"工具执行超时（{timeout}秒）")
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout)
     try:
-        result = TOOL_REGISTRY[name]["fn"](**args)
-        return str(result)
-    except Exception as e:
-        return f"工具执行出错：{type(e).__name__}: {e}"
+        return fn(**args)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 # ============================================================
@@ -317,6 +383,22 @@ if __name__ == "__main__":
         print("D-6 长期记忆验证：跨 session recall")
         print("=" * 60)
         for msg in ["我叫什么名字？", "我住在哪里？"]:
+            print(f"\n{'─' * 60}")
+            print(f"用户: {msg}")
+            print(f"{'─' * 60}")
+            reply = agent.ask(msg)
+            print(f"\nMyAgent: {reply}")
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "tools":
+        # W7 验证：真工具 + 失败处理
+        agent = MyAgent(max_history=20)
+        print("=" * 60)
+        print("W7 真工具 + 失败处理验证")
+        print("=" * 60)
+        for msg in [
+            "读一下 requirements.txt 文件",
+            "读一下 nonexistent.txt 文件",
+        ]:
             print(f"\n{'─' * 60}")
             print(f"用户: {msg}")
             print(f"{'─' * 60}")
