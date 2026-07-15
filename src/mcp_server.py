@@ -58,6 +58,7 @@ def main():
     JSON-RPC 2.0 规则：notification（无 id）不回响应。
     如果对 notification 回响应，client 不读会流串行 → 后续读错位。
     """
+    req = None
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -70,7 +71,7 @@ def main():
                 continue
             resp = _handle_request(req)
         except Exception as e:
-            req_id = req.get("id") if "req" in dir() else None
+            req_id = req.get("id") if req else None
             resp = {"jsonrpc": "2.0", "id": req_id,
                     "error": {"code": -32603, "message": str(e)}}
         print(json.dumps(resp, ensure_ascii=False), flush=True)

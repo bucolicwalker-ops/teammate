@@ -217,7 +217,7 @@ class MCPClient:
             [sys.executable, "-m", "src.mcp_server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,  # P2-3: 不读 stderr → DEVNULL 防 pipe 满死锁
             text=True,
             cwd=cwd,
         )
@@ -236,12 +236,26 @@ class MCPClient:
         return resp["result"]["content"][0]["text"]
 
     def _send(self, req: dict) -> dict:
-        """发送 JSON-RPC 请求，读响应。notification（无 id）不读响应。"""
+        """发送 JSON-RPC 请求，读响应。notification（无 id）不读响应。
+
+        P2-2: readline 加 timeout——server 崩了/不回响应不会 hang 死 Agent。
+        """
         self.proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
         if "id" not in req:
             return {}
-        line = self.proc.stdout.readline()
+        # readline with timeout（防 server 崩溃 hang）
+        def _handler(signum, frame):
+            raise TimeoutError("MCP server 响应超时")
+        old = signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(TOOL_TIMEOUT + 5)
+        try:
+            line = self.proc.stdout.readline()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+        if not line:
+            raise TimeoutError("MCP server 无响应（可能已崩溃）")
         return json.loads(line)
 
     def close(self):
