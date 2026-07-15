@@ -4,7 +4,7 @@ Tracer 记录每次 ask() 的完整链路：
   user_input → llm_call(token/延迟) → tool_call(工具/延迟) → ... → final_reply → summary
 
 trace 存内存 list，可从 /trace 端点查询。
-生产版对比：cat-cafe 的 session chain + drill-down 是持久化版（SQLite + Redis），
+生产版对比：生产级可观测平台（LangSmith/Langfuse）做持久化（DB + Redis），
 我们这是简化版（内存 list），之后对比理解 trade-off。
 """
 import json
