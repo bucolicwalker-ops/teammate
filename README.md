@@ -6,49 +6,54 @@
 
 ## 架构图
 
-```
-                    用户请求 (curl / browser / app)
-                          │
-                          ▼
-               ┌──────────────────────┐
-               │    server.py :8000   │  FastAPI
-               │ 用户隔离 + 限流 + 安全 │
-               └──────────┬───────────┘
-                          │
-                          ▼
-               ┌──────────────────────┐
-               │     agent.py         │  MyAgent
-               │  ReAct 循环 + trace   │
-               │  Plan-Execute        │
-               │  threading.Lock      │
-               └───┬──────┬──────┬────┘
-                   │      │      │
-      ┌────────────┘      │      └────────────┐
-      ▼                   ▼                   ▼
-┌───────────┐     ┌───────────────┐    ┌───────────────┐
-│ memory.py │     │   rag.py      │    │  team.py      │
-│ 短期history│     │ KnowledgeBase │    │ Supervisor    │
-│ 长期向量记忆│     │ 切块+检索+注入 │    │ 动态路由       │
-└─────┬─────┘     └───────┬───────┘    └───────────────┘
-      │                   │
-      ▼                   ▼
-┌───────────┐     ┌───────────────┐
-│embedder.py│◄────│embed_server   │
-│ MLX/HTTP  │     │ FastAPI :8765 │
-│ +batch    │     │ OpenAI 兼容   │
-└───────────┘     └───────────────┘
+```mermaid
+flowchart TD
+    User(["🖥️ 用户请求<br/>curl · browser · app"]):::user
 
-      ┌───────────┐     ┌───────────────┐
-      │ tools.py │◄────│ mcp_server.py │
-      │ 工具+失败处理│     │ MCP 独立进程   │
-      │ timeout   │     │ JSON-RPC stdio│
-      │ retry     │     └───────────────┘
-      │ 降级      │
-      └───────────┘
+    subgraph S1["🔵 接入层"]
+        Srv["server.py :8000<br/>FastAPI · 用户隔离 · 限流 · 安全"]:::access
+    end
 
-观测：trace.py（trace_id + span + token/延迟/步数）
-评估：eval.py（RAG Triad + ship gate baseline）
-安全：security.py（injection 检测 + 输出脱敏）
+    subgraph S2["🟣 编排层"]
+        Agent["agent.py · MyAgent<br/>ReAct 循环 · Plan-Execute · trace · Lock"]:::orch
+    end
+
+    subgraph S3["🟢 核心能力层"]
+        Mem["memory.py<br/>短期 history · 长期向量记忆"]:::core
+        RAG["rag.py · KnowledgeBase<br/>语义切块 · 检索 · grounding"]:::core
+        Team["team.py · Supervisor<br/>动态路由"]:::core
+    end
+
+    subgraph S4["🟠 基础设施层"]
+        Emb["embedder.py<br/>MLX / HTTP · batch"]:::infra
+        EmbSrv["embed_server :8765<br/>OpenAI 兼容"]:::infra
+        Tools["tools.py<br/>timeout · retry · 降级"]:::infra
+        MCP["mcp_server.py<br/>MCP · JSON-RPC stdio"]:::infra
+    end
+
+    subgraph S5["⚙️ 横切关注点"]
+        Trace["trace.py — trace_id · span · metric"]:::cross
+        Eval["eval.py — RAG Triad · ship gate"]:::cross
+        Sec["security.py — injection · 脱敏"]:::cross
+    end
+
+    User --> Srv
+    Srv --> Agent
+    Agent --> Mem & RAG & Team
+    Mem --> Emb
+    EmbSrv -.->|HTTP| Emb
+    MCP -.->|JSON-RPC| Tools
+    Tools -.->|tool result| Agent
+    Sec -.-> Srv
+    Trace -.-> Agent
+    Eval -.-> RAG
+
+    classDef user fill:#fff3e0,stroke:#ff9800,stroke-width:2px,color:#333
+    classDef access fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#333
+    classDef orch fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px,color:#333
+    classDef core fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#333
+    classDef infra fill:#fff8e1,stroke:#ef6c00,stroke-width:2px,color:#333
+    classDef cross fill:#eceff1,stroke:#455a64,stroke-width:2px,color:#333
 ```
 
 ## 当前进度
@@ -139,14 +144,25 @@ docker-compose up
 
 ## 架构演进
 
-```
-W1: ask() — 单次 LLM + 结构化输出
-W2: ask() — 工具循环（tool_use → execute → result → 循环）
-W3: MyAgent — self.history（短期）+ VectorMemory（长期，MLX embedding）
-W4: + KnowledgeBase — RAG pipeline（语义切块 + batch embed + grounding）
-W5: + eval.py — RAG Triad 评估 + ship gate baseline
-W6: + plan_and_execute() + team.py — Plan-Execute + Supervisor 动态路由
-W7: + tools.py + mcp_server.py — 真工具 + 失败处理 + MCP 标准化
-W8: + trace.py + server.py — 可观测（trace/token/metric）+ FastAPI 服务化
-W9: + security.py + Docker — 用户隔离 + 安全 + 限流 + 容器化部署
+```mermaid
+flowchart LR
+    W1["W1<br/>结构化输出<br/><small>L0</small>"]:::l0
+    W2["W2<br/>工具循环<br/><small>L0</small>"]:::l0
+    W3["W3<br/>短期+长期记忆<br/><small>L1</small>"]:::l1
+    W4["W4<br/>RAG pipeline<br/><small>L2</small>"]:::l2
+    W5["W5<br/>RAG 评估<br/><small>L2</small>"]:::l2
+    W6["W6<br/>规划+多Agent<br/><small>L3</small>"]:::l3
+    W7["W7<br/>MCP+真工具<br/><small>L4</small>"]:::l4
+    W8["W8<br/>可观测+服务化<br/><small>L5</small>"]:::l5
+    W9["W9<br/>安全+部署<br/><small>L6</small>"]:::l6
+
+    W1 --> W2 --> W3 --> W4 --> W5 --> W6 --> W7 --> W8 --> W9
+
+    classDef l0 fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#333
+    classDef l1 fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#333
+    classDef l2 fill:#fff8e1,stroke:#f9a825,stroke-width:2px,color:#333
+    classDef l3 fill:#fce4ec,stroke:#c62828,stroke-width:2px,color:#333
+    classDef l4 fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px,color:#333
+    classDef l5 fill:#e0f7fa,stroke:#00838f,stroke-width:2px,color:#333
+    classDef l6 fill:#efebe9,stroke:#4e342e,stroke-width:2px,color:#333
 ```
