@@ -1,0 +1,15 @@
+version: "3.8"
+services:
+  teammate:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data       # 用户记忆持久化
+      - ../bagu:/app/bagu      # 知识库（只读）
+    env_file:
+      - .env
+    environment:
+      - EMBED_ENDPOINT=http://host.docker.internal:8765
+      - KB_PATH=/app/bagu/qbank.md
+    restart: unless-stopped
