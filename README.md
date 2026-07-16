@@ -7,7 +7,7 @@
 ## 架构图
 
 ```mermaid
-flowchart TD
+graph TD
     User(["🖥️ 用户请求<br/>curl · browser · app"]):::user
 
     subgraph S1["🔵 接入层"]
@@ -31,17 +31,12 @@ flowchart TD
         MCP["mcp_server.py<br/>MCP · JSON-RPC stdio"]:::infra
     end
 
-    subgraph S5["⚙️ 横切关注点"]
-        Trace["trace.py — trace_id · span · metric"]:::cross
-        Eval["eval.py — RAG Triad · ship gate"]:::cross
-        Sec["security.py — injection · 脱敏"]:::cross
-    end
-
     User --> Srv
     Srv --> Agent
     Agent --> Mem
     Agent --> RAG
     Agent --> Team
+    Agent --> Tools
     Mem --> Emb
     EmbSrv -.->|HTTP| Emb
     MCP -.->|JSON-RPC| Tools
@@ -51,7 +46,6 @@ flowchart TD
     classDef orch fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px,color:#333
     classDef core fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#333
     classDef infra fill:#fff8e1,stroke:#ef6c00,stroke-width:2px,color:#333
-    classDef cross fill:#eceff1,stroke:#455a64,stroke-width:2px,color:#333
 ```
 
 > **横切关注点**（作用于全局，不在图中连线避免布局爆炸）：
@@ -148,7 +142,7 @@ docker-compose up
 ## 架构演进
 
 ```mermaid
-flowchart LR
+graph LR
     W1["W1 结构化输出 L0"]:::l0
     W2["W2 工具循环 L0"]:::l0
     W3["W3 短期+长期记忆 L1"]:::l1
