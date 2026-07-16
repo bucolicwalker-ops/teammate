@@ -106,7 +106,7 @@ teammate/
 │   ├── server.py       # FastAPI 服务（per-user 隔离 + LRU + 限流 + 安全 + trace）
 │   └── chat.py         # 终端交互入口
 ├── docs/
-│   └── 坑日志.md       # 13 个实战 bug（项目深挖素材）
+│   └── 坑日志.md       # 13 个实战 bug（问题定位素材）
 ├── Dockerfile          # 容器化（不含 MLX，embedding 走 HTTP）
 ├── docker-compose.yml  # 服务编排（端口 + volume + env）
 └── requirements.txt
