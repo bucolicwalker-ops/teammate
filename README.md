@@ -39,14 +39,12 @@ flowchart TD
 
     User --> Srv
     Srv --> Agent
-    Agent --> Mem & RAG & Team
+    Agent --> Mem
+    Agent --> RAG
+    Agent --> Team
     Mem --> Emb
     EmbSrv -.->|HTTP| Emb
     MCP -.->|JSON-RPC| Tools
-    Tools -.->|tool result| Agent
-    Sec -.-> Srv
-    Trace -.-> Agent
-    Eval -.-> RAG
 
     classDef user fill:#fff3e0,stroke:#ff9800,stroke-width:2px,color:#333
     classDef access fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#333
@@ -55,6 +53,11 @@ flowchart TD
     classDef infra fill:#fff8e1,stroke:#ef6c00,stroke-width:2px,color:#333
     classDef cross fill:#eceff1,stroke:#455a64,stroke-width:2px,color:#333
 ```
+
+> **横切关注点**（作用于全局，不在图中连线避免布局爆炸）：
+> - `trace.py` — trace_id + span + token/延迟/步数（注入 agent.py）
+> - `eval.py` — RAG Triad + ship gate baseline（注入 rag.py）
+> - `security.py` — injection 检测 + 输出脱敏（注入 server.py）
 
 ## 当前进度
 
@@ -146,15 +149,15 @@ docker-compose up
 
 ```mermaid
 flowchart LR
-    W1["W1<br/>结构化输出<br/><small>L0</small>"]:::l0
-    W2["W2<br/>工具循环<br/><small>L0</small>"]:::l0
-    W3["W3<br/>短期+长期记忆<br/><small>L1</small>"]:::l1
-    W4["W4<br/>RAG pipeline<br/><small>L2</small>"]:::l2
-    W5["W5<br/>RAG 评估<br/><small>L2</small>"]:::l2
-    W6["W6<br/>规划+多Agent<br/><small>L3</small>"]:::l3
-    W7["W7<br/>MCP+真工具<br/><small>L4</small>"]:::l4
-    W8["W8<br/>可观测+服务化<br/><small>L5</small>"]:::l5
-    W9["W9<br/>安全+部署<br/><small>L6</small>"]:::l6
+    W1["W1 结构化输出 L0"]:::l0
+    W2["W2 工具循环 L0"]:::l0
+    W3["W3 短期+长期记忆 L1"]:::l1
+    W4["W4 RAG pipeline L2"]:::l2
+    W5["W5 RAG 评估 L2"]:::l2
+    W6["W6 规划+多Agent L3"]:::l3
+    W7["W7 MCP+真工具 L4"]:::l4
+    W8["W8 可观测+服务化 L5"]:::l5
+    W9["W9 安全+部署 L6"]:::l6
 
     W1 --> W2 --> W3 --> W4 --> W5 --> W6 --> W7 --> W8 --> W9
 
