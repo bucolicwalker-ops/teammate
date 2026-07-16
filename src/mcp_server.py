@@ -9,7 +9,7 @@ import json
 import sys
 
 # 从 agent.py 导入工具注册表和执行器（含失败处理）
-from src.agent import TOOL_REGISTRY, execute_tool
+from src.tools import TOOL_REGISTRY, execute_tool
 
 
 def _get_tools():

@@ -20,7 +20,7 @@ load_dotenv()
 app = FastAPI(title="teammate agent service")
 
 # Agent 实例只创建一次（持久运行，记忆/KB 只加载一次）
-agent = MyAgent(max_history=20, use_long_term=True, use_knowledge=True)
+agent = MyAgent(max_history=20, use_long_term=True, use_knowledge=True, use_mcp=True)
 agent.load_knowledge(os.path.join(os.path.dirname(__file__), "..", "..", "bagu", "qbank.md"))
 
 
