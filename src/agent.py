@@ -27,6 +27,17 @@ DEFAULT_SYSTEM = (
     "你是 teammate 的 AI 队友 MyAgent。"
     "你可以调用工具来获取信息或执行计算。"
     "需要时先调工具，拿到结果后再给出回复。"
+    "如果使用了知识库或搜索结果，在回答中标注来源。"
+)
+
+RESEARCH_SYSTEM = (
+    "你是资料研究助手。流程：\n"
+    "1. 用 web_search 搜索主题相关信息\n"
+    "2. 用 fetch_url 阅读最相关的 2-3 个页面\n"
+    "3. 筛选最权威、最相关的内容\n"
+    "4. 写成结构化报告，每个论点后标 [来源:URL]\n"
+    "5. 末尾列出「## 参考链接」清单\n"
+    "不能确认的不要写，没检索到就说没找到。"
 )
 
 
@@ -114,10 +125,10 @@ class MyAgent:
     """
 
     def __init__(self, max_history: int = 20, use_long_term: bool = True,
-                 memory_path: str = "data/memory.json",
+                 memory_path: str = "data/memory.db",
                  embed_endpoint: str | None = None,
                  use_knowledge: bool = False,
-                 knowledge_path: str = "data/knowledge.json",
+                 knowledge_path: str = "data/knowledge.db",
                  system: str | None = None,
                  use_mcp: bool = False):
         self.history: list[dict] = []
@@ -140,7 +151,13 @@ class MyAgent:
         with self._lock:
             return self._ask_unlocked(user_msg, max_steps)
 
-    def _ask_unlocked(self, user_msg: str, max_steps: int = 5) -> str:
+    def research(self, topic: str, max_steps: int = 12) -> str:
+        """资料研究助手：输入主题 → 搜索 → 筛选 → 总结 → 引用链接。"""
+        with self._lock:
+            return self._ask_unlocked(topic, max_steps, system=RESEARCH_SYSTEM, max_tokens=4096)
+
+    def _ask_unlocked(self, user_msg: str, max_steps: int = 5,
+                      system: str | None = None, max_tokens: int = 1024) -> str:
         """多工具 Agent 主循环（带短期 + 长期记忆 + trace）。
 
         短期：self.history 跨调用存活。
@@ -152,16 +169,19 @@ class MyAgent:
         kb_chunks = []
         if self.knowledge:
             kb_chunks = self.knowledge.retrieve(user_msg, top_k=3)
-        system = self.system
+        system = system or self.system
         if recalled:
             system += self.memory.format_context(recalled)
         if kb_chunks:
             system += self.knowledge.format_context(kb_chunks)
+        if self.knowledge is not None and not kb_chunks:
+            system += "\n[注：知识库未检索到相关内容，请基于自身知识回答并说明无可靠来源]"
 
         self.history.append({"role": "user", "content": user_msg})
         self._truncate()
 
         trace_id = self.tracer.start_trace(user_msg)
+        seen_calls = set()
 
         for step in range(max_steps):
             print(f"\n  ── 第 {step + 1} 轮 ──")
@@ -169,7 +189,7 @@ class MyAgent:
             try:
                 resp = client.messages.create(
                     model=MODEL,
-                    max_tokens=1024,
+                    max_tokens=max_tokens,
                     system=system,
                     tools=TOOLS,
                     messages=self.history,
@@ -202,15 +222,21 @@ class MyAgent:
             self.history.append({"role": "assistant", "content": resp.content})
             tool_results = []
             for tc in tool_calls:
-                print(f"  调工具: {tc.name}({tc.input})")
-                t_tool = time.time()
-                if self.mcp_client:
-                    result = self.mcp_client.call_tool(tc.name, tc.input)
+                call_key = (tc.name, str(tc.input))
+                if call_key in seen_calls:
+                    result = f"⚠️ 重复调用 {tc.name}({tc.input})，已跳过"
+                    print(f"  {result}")
                 else:
-                    result = execute_tool(tc.name, tc.input)
-                tool_latency = time.time() - t_tool
-                self.tracer.log_tool_call(trace_id, tc.name, tc.input, result, tool_latency)
-                print(f"  结果: {result}")
+                    seen_calls.add(call_key)
+                    print(f"  调工具: {tc.name}({tc.input})")
+                    t_tool = time.time()
+                    if self.mcp_client:
+                        result = self.mcp_client.call_tool(tc.name, tc.input)
+                    else:
+                        result = execute_tool(tc.name, tc.input)
+                    tool_latency = time.time() - t_tool
+                    self.tracer.log_tool_call(trace_id, tc.name, tc.input, result, tool_latency)
+                    print(f"  结果: {result}")
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tc.id,

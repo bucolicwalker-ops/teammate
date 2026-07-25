@@ -4,22 +4,69 @@ pipeline: load(file) → chunk(text, mode) → batch embed(chunks) → store →
 切块模式：
 - "fixed"：固定大小 + overlap（通用，任何文档）
 - "semantic"：按 markdown 标题切（#### 级别，保持问题/段落完整，不断义）
+
+持久化：SQLite（原子写入、并发安全）。
+多格式支持：.md/.txt 直接读；PDF/Word/Excel 等用 MarkItDown 转 Markdown。
 """
 import json
 import os
-import re
+import sqlite3
 from src.embedder import Embedder
 
 
 class KnowledgeBase:
     """RAG 知识库：文档 → chunk → 向量 → 检索 → 注入 prompt。"""
 
-    def __init__(self, storage_path: str = "data/knowledge.json",
+    def __init__(self, storage_path: str = "data/knowledge.db",
                  embed_endpoint: str | None = None):
         self.storage_path = storage_path
         self._embedder = Embedder(embed_endpoint)
         self.chunks: list[dict] = []
+        self._db = None
+        self._init_db()
+        self._migrate_from_json()
         self._load()
+
+    def _init_db(self):
+        """初始化 SQLite 表结构。"""
+        os.makedirs(os.path.dirname(self.storage_path) or ".", exist_ok=True)
+        self._db = sqlite3.connect(self.storage_path)
+        self._db.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                vector TEXT NOT NULL,
+                source TEXT,
+                chunk_idx INTEGER
+            )
+        """)
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source ON chunks(source)"
+        )
+        self._db.commit()
+
+    def _migrate_from_json(self):
+        """如果旧 JSON 文件存在且 DB 为空，导入旧数据。"""
+        json_path = self.storage_path.replace('.db', '.json')
+        if not os.path.exists(json_path):
+            return
+        count = self._db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        if count > 0:
+            return
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                old_chunks = json.load(f)
+            for chunk in old_chunks:
+                self._db.execute(
+                    "INSERT INTO chunks (text, vector, source, chunk_idx) "
+                    "VALUES (?, ?, ?, ?)",
+                    (chunk.get("text", ""), json.dumps(chunk.get("vector", [])),
+                     chunk.get("source", ""), chunk.get("chunk_idx", 0))
+                )
+            self._db.commit()
+            print(f"  📦 从旧 JSON 迁移了 {len(old_chunks)} 条 chunk")
+        except Exception as e:
+            print(f"  ⚠️ JSON 迁移失败（不影响使用）: {e}")
 
     def load_document(self, file_path: str, chunk_size: int = 500,
                       overlap: int = 50, mode: str = "semantic") -> int:
@@ -27,9 +74,19 @@ class KnowledgeBase:
 
         mode="semantic"：按 #### 标题切（保持问题/段落完整）
         mode="fixed"：固定大小 + overlap（通用）
+
+        多格式支持：.md/.txt 直接读；PDF/Word/Excel 等用 MarkItDown 转 Markdown。
         """
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ('.md', '.txt', ''):
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        else:
+            from markitdown import MarkItDown
+            md = MarkItDown()
+            result = md.convert(file_path)
+            text = result.text_content or ""
+            print(f"  🔄 MarkItDown 转换: {ext} → {len(text)} 字符 Markdown")
 
         if mode == "semantic":
             text_chunks = self._chunk_by_headers(text)
@@ -43,13 +100,18 @@ class KnowledgeBase:
 
         source = os.path.basename(file_path)
         for i, (chunk_text, vec) in enumerate(zip(text_chunks, vectors)):
+            self._db.execute(
+                "INSERT INTO chunks (text, vector, source, chunk_idx) "
+                "VALUES (?, ?, ?, ?)",
+                (chunk_text, json.dumps(vec), source, i)
+            )
             self.chunks.append({
                 "text": chunk_text,
                 "vector": vec,
                 "source": source,
                 "chunk_idx": i,
             })
-        self._save()
+        self._db.commit()
         return len(text_chunks)
 
     def retrieve(self, query: str, top_k: int = 3,
@@ -123,17 +185,22 @@ class KnowledgeBase:
         return sum(x * y for x, y in zip(a, b))
 
     def _load(self):
-        if os.path.exists(self.storage_path):
-            try:
-                with open(self.storage_path, "r", encoding="utf-8") as f:
-                    self.chunks = json.load(f)
-            except (json.JSONDecodeError, IOError) as e:
-                print(f"  ⚠️ 知识库文件损坏，从空开始: {e}")
-                self.chunks = []
+        """从 SQLite 加载全部 chunk 到内存（供余弦检索扫描）。"""
+        rows = self._db.execute(
+            "SELECT text, vector, source, chunk_idx FROM chunks"
+        ).fetchall()
+        self.chunks = [
+            {
+                "text": r[0],
+                "vector": json.loads(r[1]),
+                "source": r[2],
+                "chunk_idx": r[3],
+            }
+            for r in rows
+        ]
 
-    def _save(self):
-        os.makedirs(os.path.dirname(self.storage_path) or ".", exist_ok=True)
-        tmp_path = self.storage_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(self.chunks, f, ensure_ascii=False)
-        os.rename(tmp_path, self.storage_path)
+    def close(self):
+        """关闭数据库连接。"""
+        if self._db:
+            self._db.close()
+            self._db = None

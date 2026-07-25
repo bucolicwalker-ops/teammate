@@ -31,7 +31,7 @@ app = FastAPI(title="teammate agent service")
 # 共享知识库（只读，所有用户共享，只加载一次）
 # ============================================================
 
-_kb = KnowledgeBase("data/knowledge.json", EMBED_ENDPOINT)
+_kb = KnowledgeBase("data/knowledge.db", EMBED_ENDPOINT)
 if not _kb.chunks:
     _kb.load_document(KB_PATH)
     print(f"  📄 知识库已加载（共享）")
@@ -63,7 +63,7 @@ def get_agent(user_id: str) -> MyAgent:
         a = MyAgent(
             max_history=20,
             use_long_term=True,
-            memory_path=f"data/memory_{user_id}.json",
+            memory_path=f"data/memory_{user_id}.db",
             use_knowledge=False,
             embed_endpoint=EMBED_ENDPOINT,
             use_mcp=True,

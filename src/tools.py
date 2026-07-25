@@ -9,7 +9,10 @@ Anthropic client / VectorMemory / KnowledgeBase（避免子进程浪费）。
   agent.py       ← MyAgent + MCPClient（from src.tools import ...，"谁来用"）
 """
 import ast
+import json
 import operator
+import re
+import requests
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 
@@ -70,6 +73,60 @@ def read_file(path: str) -> str:
         return f.read(2000)
 
 
+def web_search(query: str) -> str:
+    """搜索网络，返回带URL的结果（DuckDuckGo，免费无需API key）。
+
+    返回 JSON 字符串：[{"url":..., "title":..., "snippet":...}]
+    最多 5 条，每条带 URL 供 fetch_url 深入阅读。
+    """
+    from ddgs import DDGS
+    with DDGS() as ddg:
+        results = list(ddg.text(query, max_results=5))
+    items = [{"url": r.get("href") or r.get("link", ""),
+              "title": r.get("title", ""),
+              "snippet": r.get("body") or r.get("snippet", "")}
+             for r in results]
+    return json.dumps(items, ensure_ascii=False)
+
+
+def _is_safe_url(url: str) -> bool:
+    """检查 URL 是否安全（防 SSRF）——拒绝 localhost/内网/非 http(s)。"""
+    from urllib.parse import urlparse
+    import ipaddress
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        return False
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return False
+    if hostname in ('localhost', '0.0.0.0', '::1', '::'):
+        return False
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return False
+    except ValueError:
+        pass  # 域名（非 IP），允许
+    return True
+
+
+def fetch_url(url: str) -> str:
+    """抓取网页内容，HTML → Markdown（前3000字）。
+
+    用 markdownify 做 HTML→Markdown 转换，保持标题/链接结构。
+    超时/404 等错误抛回 execute_tool 的 retry/降级机制处理。
+    SSRF 防护：拒绝 localhost/内网/非 http(s) URL。
+    """
+    if not _is_safe_url(url):
+        return f"错误：URL 不安全（拒绝 localhost/内网/非 http(s)）：{url}"
+    resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    resp.raise_for_status()
+    from markdownify import markdownify as html_to_md
+    text = html_to_md(resp.text)
+    text = re.sub(r'\n{3,}', '\n\n', text).strip()
+    return text[:3000]
+
+
 # ============================================================
 # 注册表 + 执行器
 # ============================================================
@@ -117,6 +174,28 @@ TOOL_REGISTRY = {
                 "path": {"type": "string", "description": "文件路径，如 src/agent.py"},
             },
             "required": ["path"],
+        },
+    },
+    "web_search": {
+        "fn": web_search,
+        "description": "搜索网络，返回带URL的结果（DuckDuckGo）。返回JSON数组，每条含url/title/snippet。用fetch_url深入阅读感兴趣的页面。",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词"},
+            },
+            "required": ["query"],
+        },
+    },
+    "fetch_url": {
+        "fn": fetch_url,
+        "description": "抓取网页内容，转为Markdown文本（限3000字）。传入web_search返回的URL。",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "要抓取的网页URL"},
+            },
+            "required": ["url"],
         },
     },
 }
