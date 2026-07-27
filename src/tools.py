@@ -186,6 +186,7 @@ TOOL_REGISTRY = {
             },
             "required": ["query"],
         },
+        "timeout": 30,
     },
     "fetch_url": {
         "fn": fetch_url,
@@ -197,6 +198,7 @@ TOOL_REGISTRY = {
             },
             "required": ["url"],
         },
+        "timeout": 20,
     },
 }
 
@@ -223,7 +225,8 @@ def execute_tool(name: str, args: dict) -> str:
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            result = _call_with_timeout(TOOL_REGISTRY[name]["fn"], args, TOOL_TIMEOUT)
+            timeout = TOOL_REGISTRY[name].get("timeout", TOOL_TIMEOUT)
+            result = _call_with_timeout(TOOL_REGISTRY[name]["fn"], args, timeout)
             return str(result)
         except RETRYABLE_ERRORS as e:
             if attempt < MAX_RETRIES:

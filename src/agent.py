@@ -154,7 +154,7 @@ class MyAgent:
     def research(self, topic: str, max_steps: int = 12) -> str:
         """资料研究助手：输入主题 → 搜索 → 筛选 → 总结 → 引用链接。"""
         with self._lock:
-            return self._ask_unlocked(topic, max_steps, system=RESEARCH_SYSTEM, max_tokens=4096)
+            return self._ask_unlocked(topic, max_steps, system=RESEARCH_SYSTEM, max_tokens=8192)
 
     def _ask_unlocked(self, user_msg: str, max_steps: int = 5,
                       system: str | None = None, max_tokens: int = 1024) -> str:
@@ -410,6 +410,21 @@ if __name__ == "__main__":
             print(f"{'─' * 60}")
             reply = agent.ask(msg)
             print(f"\nMyAgent: {reply}")
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "research":
+        # Stage 2 验证：资料研究助手——搜索→筛选→总结→引用
+        agent = MyAgent(max_history=20, use_long_term=False, use_knowledge=False)
+        topic = sys.argv[2] if len(sys.argv) > 2 else "RAG检索增强生成技术"
+        print("=" * 60)
+        print("Stage 2 资料研究助手验证")
+        print("=" * 60)
+        print(f"\n主题: {topic}")
+        print(f"{'─' * 60}")
+        report = agent.research(topic)
+        print(f"\n{'=' * 60}")
+        print("研究报告:")
+        print(f"{'=' * 60}")
+        print(report)
 
     else:
         # D-5 验证：短期记忆——多轮对话能接住上下文
