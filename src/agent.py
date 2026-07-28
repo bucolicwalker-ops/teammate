@@ -15,6 +15,7 @@ from src.memory import VectorMemory
 from src.rag import KnowledgeBase
 from src.trace import Tracer
 from src.tools import TOOL_REGISTRY, TOOLS, execute_tool, TOOL_TIMEOUT, trigger_hooks, set_task_handler, SUB_TOOLS
+from src.agents.base import AgentBase
 
 load_dotenv()
 client = Anthropic(
@@ -218,7 +219,7 @@ set_task_handler(spawn_subagent)
 # ④ MyAgent class
 # ============================================================
 
-class MyAgent:
+class MyAgent(AgentBase):
     """带短期 + 长期记忆的 Agent。
 
     短期：self.history（内存 list，session 内跨轮存活）。
@@ -470,6 +471,15 @@ class MyAgent:
         )
         final = "".join(b.text for b in summary_resp.content if b.type == "text")
         return final
+
+    def close(self):
+        """清理资源（MCP 连接、数据库等）。AgentBase 接口实现。"""
+        if self.mcp_client:
+            self.mcp_client.close()
+        if self.memory and hasattr(self.memory, 'close'):
+            self.memory.close()
+        if self.knowledge and hasattr(self.knowledge, 'close'):
+            self.knowledge.close()
 
 
 # ============================================================
