@@ -248,3 +248,30 @@ cp .env.example .env  # 填 ANTHROPIC_API_KEY
 | s20 | Comprehensive | — | 目标 |
 
 **完成度：9/11（s07/s11 待做，s05/s09 部分实现）**
+
+---
+
+## Stage 4: 多 Agent 协作（参照 cat-cafe）
+
+> 设计文档：[`docs/stage4-1-role-taxonomy.md`](docs/stage4-1-role-taxonomy.md)
+
+### 4 阶段里程碑
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| **4.1 角色与接口** | 5 角色（planner/executor/reviewer/critic/router）+ AgentBase I/O schema + 停止条件 + Team Roster 设计 | ✅ 设计完成 |
+| **4.2 外部 Agent 集成** | 实现 AgentIdentity/Task/TaskResult + 改 base.py + MyAgent 实现新接口 + team_roster.json + Roster 加载器 | ⏳ 下一步 |
+| **4.3 Thread + @mention 路由** | 建 thread store + 行首 @ parser + supervisor router（深度参照 cat-cafe F043） | ⏳ |
+| **4.4 共享记忆 + 任务追踪** | cross-agent evidence store + persistent tasks + hold/wait | ⏳ |
+| **4.5 评估 + 单 Agent 退化** | 产出 research→write→review→revise，router 能判断单 agent 够用 | ⏳ |
+
+### 三层身份模型（参照 cat-cafe F032）
+
+| 维度 | 含义 | teammate 例 |
+|---|---|---|
+| Family | 接入通道 / 模型家族 | myagent / codex / claude-code |
+| Individual | 具体一个 agent 实例 | myagent-1 / codex-1 / cc-1 |
+| Role | 干什么活 | planner / executor / reviewer / critic / router |
+
+代码必经 砚砚(@缅因猫) 跨族 review（家规铁律 2）。
+
