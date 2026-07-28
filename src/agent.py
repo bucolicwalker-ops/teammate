@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from src.memory import VectorMemory
 from src.rag import KnowledgeBase
 from src.trace import Tracer
-from src.tools import TOOL_REGISTRY, TOOLS, execute_tool, TOOL_TIMEOUT
+from src.tools import TOOL_REGISTRY, TOOLS, execute_tool, TOOL_TIMEOUT, trigger_hooks, set_task_handler, SUB_TOOLS
 
 load_dotenv()
 client = Anthropic(
@@ -39,6 +39,38 @@ RESEARCH_SYSTEM = (
     "5. 末尾列出「## 参考链接」清单\n"
     "不能确认的不要写，没检索到就说没找到。"
 )
+
+SUB_SYSTEM = (
+    "你是子 Agent。完成分配给你的任务，返回简洁总结。不要再委派。"
+)
+
+SUB_MAX_TURNS = 30
+
+
+def load_system_prompt() -> str:
+    """运行时组装 system prompt（s10）：基础 prompt + 文件加载 + 动态信息。
+
+    Claude Code 用 CLAUDE.md 做项目级配置。teammate 用 system_prompt.md。
+    如果文件存在，追加其内容；不存在就用 DEFAULT_SYSTEM。
+    """
+    parts = [DEFAULT_SYSTEM]
+
+    # 从文件加载（CLAUDE.md 式配置）
+    prompt_file = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "system_prompt.md"
+    )
+    if os.path.exists(prompt_file):
+        with open(prompt_file, "r", encoding="utf-8") as f:
+            file_content = f.read().strip()
+        if file_content:
+            parts.append(file_content)
+
+    # 动态信息
+    parts.append(f"\n工作目录: {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}")
+    parts.append(f"可用工具: {', '.join(TOOL_REGISTRY.keys())}")
+
+    return "\n\n".join(parts)
 
 
 
@@ -112,6 +144,77 @@ class MCPClient:
 
 
 # ============================================================
+# ③-bis Subagent (from learn-claude-code s06)
+# 全新 messages[] + 独立 context + 只回传结论
+# ============================================================
+
+def _extract_text(content) -> str:
+    """从消息 content blocks 提取文本。"""
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
+
+
+def spawn_subagent(description: str) -> str:
+    """启动子 Agent——全新 messages[]，独立 context，只回传结论。
+
+    中间过程（工具调用、搜索结果）全部丢弃，只把最终文本结论回传给主 Agent。
+    子 Agent 不能调 task 工具（防递归）。
+    """
+    print(f"\n  🟣 [Subagent spawned]")
+    messages = [{"role": "user", "content": description}]
+
+    for _ in range(SUB_MAX_TURNS):
+        resp = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=4096,
+        )
+        messages.append({"role": "assistant", "content": resp.content})
+
+        if resp.stop_reason != "tool_use":
+            break
+
+        results = []
+        for block in resp.content:
+            if block.type != "tool_use":
+                continue
+            # 子 Agent 也走 PreToolUse hooks（权限不跳过）
+            blocked = trigger_hooks("PreToolUse", block.name, block.input)
+            if blocked:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": str(blocked)})
+                continue
+            # 子 Agent 不能调 task（防递归）
+            if block.name == "task":
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": "Error: subagent cannot spawn sub-subagents"})
+                continue
+            output = execute_tool(block.name, block.input)
+            trigger_hooks("PostToolUse", block.name, block.input, output)
+            print(f"    [sub] {block.name}: {str(output)[:80]}")
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": output})
+        messages.append({"role": "user", "content": results})
+
+    # 只回传结论文本，整个 messages 丢弃
+    result = _extract_text(messages[-1]["content"])
+    if not result:
+        for msg in reversed(messages):
+            if msg["role"] == "assistant":
+                result = _extract_text(msg["content"])
+                if result:
+                    break
+        if not result:
+            result = f"Subagent stopped after {SUB_MAX_TURNS} turns without final answer."
+    print(f"  🟣 [Subagent done]")
+    return result
+
+
+# 注册 subagent handler（late binding 到 tools.py 的 run_task）
+set_task_handler(spawn_subagent)
+
+
+# ============================================================
 # ④ MyAgent class
 # ============================================================
 
@@ -133,7 +236,7 @@ class MyAgent:
                  use_mcp: bool = False):
         self.history: list[dict] = []
         self.max_history = max_history
-        self.system = system or DEFAULT_SYSTEM
+        self.system = system or load_system_prompt()
         self.memory = VectorMemory(memory_path, embed_endpoint) if use_long_term else None
         self.knowledge = KnowledgeBase(knowledge_path, embed_endpoint) if use_knowledge else None
         self.mcp_client = MCPClient() if use_mcp else None
@@ -177,6 +280,8 @@ class MyAgent:
         if self.knowledge is not None and not kb_chunks:
             system += "\n[注：知识库未检索到相关内容，请基于自身知识回答并说明无可靠来源]"
 
+        # s04: UserPromptSubmit hook
+        trigger_hooks("UserPromptSubmit", user_msg)
         self.history.append({"role": "user", "content": user_msg})
         self._truncate()
 
@@ -213,6 +318,12 @@ class MyAgent:
             if not tool_calls:
                 final = "".join(b.text for b in texts)
                 self.history.append({"role": "assistant", "content": final})
+                # s04: Stop hook — 可拦截结束，强制续跑
+                force = trigger_hooks("Stop", self.history)
+                if force:
+                    self.history.append({"role": "user", "content": force})
+                    print(f"  [HOOK] Stop: 强制续跑")
+                    continue
                 if self.memory:
                     self.memory.add(f"用户: {user_msg}\nMyAgent: {final}")
                 self.tracer.finish_trace(trace_id, final)
@@ -252,26 +363,56 @@ class MyAgent:
         return fallback
 
     def _truncate(self):
-        """截断策略：保留最近 max_history 条，但确保不破坏 user/assistant 配对。
+        """上下文压缩（s08）：snip（截断大输出）+ compact（LLM 总结旧消息）。
 
-        盲切片会从 turn 中间断开——首条可能是 assistant 或 tool_result，
-        API 要求 messages 必须以 proper user 消息开头且交替配对。
-        修复：切片后从头部丢弃不完整的消息，直到首条是 user + string content。
-        注意：清理后实际条数可能少于 max_history（连带丢了完整 turn 的碎片）。
-
-        进阶：按轮截断（turn-aware）比按消息截断更干净——
-        不会连带丢配对；摘要压缩（用 LLM summarize 老对话）；
-        混合（老对话 summarize + 近 N 轮保留原文）。
+        两步：
+        1. snipCompact: 遍历 history，截断超过 2000 字的 tool_result
+        2. summaryCompact: 超过 max_history 时，用 LLM 总结旧消息替换为一条 summary
         """
+        # Step 1: snipCompact — 截断大 tool_result
+        MAX_TOOL_RESULT = 2000
+        for msg in self.history:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        text = block.get("content", "")
+                        if len(str(text)) > MAX_TOOL_RESULT:
+                            block["content"] = str(text)[:MAX_TOOL_RESULT] + \
+                                f"\n...(已截断，原 {len(str(text))} 字符)"
+
+        # Step 2: 没超长就不用 compact
         if len(self.history) <= self.max_history:
             return
-        self.history = self.history[-self.max_history:]
-        while self.history:
-            first = self.history[0]
-            if first["role"] == "user" and isinstance(first["content"], str):
-                break
+
+        old = self.history[:len(self.history) - self.max_history]
+        recent = self.history[len(self.history) - self.max_history:]
+
+        # 用 LLM 总结旧消息
+        summary_input = "请用2-3句话总结以下对话的关键信息：\n"
+        for msg in old:
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                summary_input += f"{role}: {content[:300]}\n"
+            elif isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        summary_input += f"{role}: {b['text'][:300]}\n"
+
+        try:
+            resp = client.messages.create(
+                model=MODEL, max_tokens=300,
+                messages=[{"role": "user", "content": summary_input}],
+            )
+            summary = "".join(b.text for b in resp.content if b.type == "text")
+        except Exception:
+            summary = "（对话历史已截断，LLM 总结失败）"
+
+        self.history = [{"role": "user", "content": f"[之前的对话总结] {summary}"}] + recent
+        while self.history and not (self.history[0]["role"] == "user" and isinstance(self.history[0]["content"], str)):
             self.history.pop(0)
-        print(f"  📝 历史截断：保留最近 {len(self.history)} 条消息")
+        print(f"  📝 上下文压缩：snip + LLM 总结，保留最近 {len(self.history)} 条")
 
     def plan_and_execute(self, user_msg: str, max_steps: int = 8) -> str:
         """Plan-Execute：先规划全部步骤，再逐步执行，最后汇总。

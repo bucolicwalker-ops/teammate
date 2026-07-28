@@ -11,8 +11,10 @@ Anthropic client / VectorMemory / KnowledgeBase（避免子进程浪费）。
 import ast
 import json
 import operator
+import os
 import re
 import requests
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 
@@ -202,14 +204,158 @@ TOOL_REGISTRY = {
     },
 }
 
+# Subagent late binding — handler set from agent.py（需要 LLM client）
+_task_handler = None
+
+def set_task_handler(handler):
+    global _task_handler
+    _task_handler = handler
+
+def run_task(description: str) -> str:
+    if _task_handler:
+        return _task_handler(description)
+    return "Error: subagent not configured"
+
+TOOL_REGISTRY["task"] = {
+    "fn": run_task,
+    "description": "启动子Agent处理复杂子任务。只回传最终结论，中间过程不污染主对话。",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "description": {"type": "string", "description": "子任务描述"},
+        },
+        "required": ["description"],
+    },
+}
+
 TOOLS = [
     {"name": name, "description": cfg["description"], "input_schema": cfg["schema"]}
     for name, cfg in TOOL_REGISTRY.items()
 ]
 
+# 子 Agent 工具集：去掉 task（防递归）
+SUB_TOOLS = [t for t in TOOLS if t["name"] != "task"]
+
 TOOL_TIMEOUT = 10  # 秒
 MAX_RETRIES = 2
 RETRYABLE_ERRORS = (TimeoutError, ConnectionError)  # 临时性错误才重试
+
+WORKDIR = Path(__file__).parent.parent.resolve()  # teammate 项目根目录
+
+
+# ============================================================
+# Permission System (from learn-claude-code s03)
+# 三道闸门：deny list → rules → user approval
+# ============================================================
+
+# Gate 1: 硬拒绝列表 — 路径/模式直接拦，不问用户
+DENY_PATTERNS = [".env", ".ssh", ".git/config", "/etc/passwd", "/etc/shadow", "/etc/sudoers"]
+
+
+def check_deny_list(tool_name: str, args: dict) -> str | None:
+    """Gate 1: 检查是否命中拒绝列表。"""
+    for pattern in DENY_PATTERNS:
+        for val in args.values():
+            if isinstance(val, str) and pattern in val:
+                return f"Blocked: '{pattern}' is on the deny list"
+    return None
+
+
+# Gate 2: 规则匹配 — 声明式，可扩展
+PERMISSION_RULES = [
+    {
+        "tools": ["read_file"],
+        "check": lambda args: not _is_safe_path(args.get("path", "")),
+        "message": "Reading outside workspace",
+    },
+]
+
+
+def _is_safe_path(p: str) -> bool:
+    """检查路径是否在工作区内。"""
+    try:
+        path = Path(p).resolve()
+        return path.is_relative_to(WORKDIR)
+    except Exception:
+        return False
+
+
+def check_rules(tool_name: str, args: dict) -> str | None:
+    """Gate 2: 检查规则匹配。命中才走 Gate 3。"""
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
+
+
+# Gate 3: 用户审批
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    """Gate 3: 暂停等用户确认。非交互模式自动拒绝。"""
+    import sys
+    if not sys.stdin.isatty():
+        return "deny"  # 非交互模式（server/CI）自动拒绝
+    print(f"\n\033[33m⚠  {reason}\033[0m")
+    print(f"   Tool: {tool_name}({args})")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+def check_permission(name: str, args: dict) -> tuple[bool, str]:
+    """三道闸门权限管线。返回 (是否允许, 原因)。"""
+    # Gate 1: deny list
+    reason = check_deny_list(name, args)
+    if reason:
+        return False, reason
+    # Gate 2: rules → Gate 3: user approval
+    reason = check_rules(name, args)
+    if reason:
+        if ask_user(name, args, reason) == "deny":
+            return False, reason
+    return True, ""
+
+
+# ============================================================
+# Hook System (from learn-claude-code s04)
+# 扩展逻辑挂到 hook 上，execute_tool / agent loop 不改
+# ============================================================
+
+HOOKS = {"PreToolUse": [], "PostToolUse": [], "Stop": [], "UserPromptSubmit": []}
+
+
+def register_hook(event: str, callback):
+    """注册 hook：event 发生时调用 callback。"""
+    HOOKS[event].append(callback)
+
+
+def trigger_hooks(event: str, *args):
+    """触发事件的所有 hook。第一个返回非 None 的拦截。"""
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:
+            return result
+    return None
+
+
+# --- hook 实现 ---
+
+def permission_hook(name: str, args: dict) -> str | None:
+    """PreToolUse: s03 权限检查（三道闸门搬过来）。"""
+    allowed, reason = check_permission(name, args)
+    if not allowed:
+        return f"Permission denied: {reason}"
+    return None
+
+
+def log_hook(name: str, args: dict) -> str | None:
+    """PreToolUse: 记录每次工具调用。"""
+    preview = str(list(args.values())[:2])[:60]
+    print(f"  [HOOK] {name}({preview})")
+    return None
+
+
+# 注册 hook
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
 
 
 def execute_tool(name: str, args: dict) -> str:
@@ -223,11 +369,20 @@ def execute_tool(name: str, args: dict) -> str:
     if name not in TOOL_REGISTRY:
         return f"错误：未知工具 '{name}'，可用工具：{list(TOOL_REGISTRY.keys())}"
 
+    # s04: PreToolUse hooks（替代 s03 的 check_permission 直接调用）
+    blocked = trigger_hooks("PreToolUse", name, args)
+    if blocked:
+        print(f"  ⛔ {blocked}")
+        return f"⛔ {blocked}"
+
     for attempt in range(MAX_RETRIES + 1):
         try:
             timeout = TOOL_REGISTRY[name].get("timeout", TOOL_TIMEOUT)
             result = _call_with_timeout(TOOL_REGISTRY[name]["fn"], args, timeout)
-            return str(result)
+            output = str(result)
+            # s04: PostToolUse hooks
+            trigger_hooks("PostToolUse", name, args, output)
+            return output
         except RETRYABLE_ERRORS as e:
             if attempt < MAX_RETRIES:
                 print(f"  ⚠️ 工具 {name} 第{attempt+1}次失败（{type(e).__name__}），重试...")
