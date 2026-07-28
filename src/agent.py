@@ -280,8 +280,10 @@ class MyAgent:
         if self.knowledge is not None and not kb_chunks:
             system += "\n[注：知识库未检索到相关内容，请基于自身知识回答并说明无可靠来源]"
 
-        # s04: UserPromptSubmit hook
-        trigger_hooks("UserPromptSubmit", user_msg)
+        # s04: UserPromptSubmit hook（返回值非 None = 拦截输入）
+        blocked = trigger_hooks("UserPromptSubmit", user_msg)
+        if blocked:
+            return f"⛔ {blocked}"
         self.history.append({"role": "user", "content": user_msg})
         self._truncate()
 
