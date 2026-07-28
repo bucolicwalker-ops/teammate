@@ -163,3 +163,88 @@ graph LR
     classDef l5 fill:#e0f7fa,stroke:#00838f,stroke-width:2px,color:#333
     classDef l6 fill:#efebe9,stroke:#4e342e,stroke-width:2px,color:#333
 ```
+
+---
+
+## Stage 3: Harness Demo（参照 Claude Code）
+
+### 5 核心组件映射
+
+| 组件 | Claude Code | teammate 实现 | 文件:行号 |
+|---|---|---|---|
+| Agent Loop | while True + stop_reason | for step in range + stop_reason | `agent.py:188` |
+| Tool Registry | TOOL_HANDLERS dispatch | TOOL_REGISTRY + execute_tool | `tools.py:136,334` |
+| Permission Gate | PreToolUse hook + deny/ask/allow | 三道闸门 + permission_hook | `tools.py:225,276,314` |
+| Session Store | context window + auto memory | VectorMemory (SQLite) + self.history | `memory.py:12`, `agent.py:134` |
+| Context Compaction | multi-layer compact | snipCompact + LLM summaryCompact | `agent.py:340` |
+
+### Claude Code 设计哲学对照
+
+| 原则 | teammate 证据 |
+|---|---|
+| 模型=智能 Harness=环境 | agent loop 只执行不决策，LLM 决定调什么工具 |
+| 一个 loop 不改变 | 加了 permission/hooks/subagent/compact，loop 结构未变 |
+| 扩展不修改只注册 | register_hook() 加功能，execute_tool 不改 |
+| 一机制一件事 | permission/hooks/subagent 各自独立 |
+| 渐进复杂度 | W1→W2→...→research 逐步加，每步独立可跑 |
+| Harness 质量决定上限 | 同 GLM-5.2，DEFAULT vs RESEARCH_SYSTEM 能力不同 |
+| Agent≠Workflow | research() 只给方向，具体怎么做 LLM 自己决定 |
+
+### 运行步骤
+
+```bash
+cd teammate
+.venv/bin/pip install -r requirements.txt
+cp .env.example .env  # 填 ANTHROPIC_API_KEY
+
+# 研究助手（Stage 2 产出）
+.venv/bin/python -m src.agent research "RAG检索增强生成技术"
+
+# 多轮对话（短期记忆验证）
+.venv/bin/python -m src.agent
+
+# RAG 知识库问答
+.venv/bin/python -m src.agent rag
+
+# Plan-Execute
+.venv/bin/python -m src.agent plan
+```
+
+### 示例输入输出
+
+输入：`.venv/bin/python -m src.agent research "RAG检索增强生成技术"`
+
+输出：8 章节 RAG 研究报告，每段带 `[来源:URL]` 引用，末尾 14 条参考链接。
+- 5 轮 agent 循环：2× web_search + 5× fetch_url
+- 工具调用日志通过 Tracer 输出（trace_id + event + timestamp）
+
+### 失败记录
+
+| 失败 | 原因 | 处理 | 代码位置 |
+|---|---|---|---|
+| web_search 超时 | DuckDuckGo 响应 >10s | per-tool timeout 调到 30s | `tools.py:179` |
+| fetch_url 403 | 知乎/Medium 反爬 | 错误回灌给 LLM，自动换源 | `tools.py:119` |
+| read_file .env | 敏感文件 | DENY_PATTERNS 拦截 | `tools.py:225` |
+| read_file /tmp | 工作区外 | safe_path 拦截 + 非交互自动拒 | `tools.py:248` |
+| 重复工具调用 | LLM 循环调同参数 | seen_calls 检测跳过 | `agent.py:184,226` |
+| max_tokens 截断 | 4096 不够写完报告 | research 模式调到 8192 | `agent.py:157` |
+
+### learn-claude-code 机制对照（s01-s20）
+
+| 课 | 机制 | teammate | 证据 |
+|---|---|---|---|
+| s01 | Agent Loop | ✅ | agent.py:188 |
+| s02 | Tool Use | ✅ | tools.py:136 |
+| s03 | Permission | ✅ | tools.py:225-287 |
+| s04 | Hooks | ✅ | tools.py:295-331 |
+| s05 | TodoWrite | ⚠️ | agent.py:284 plan_and_execute |
+| s06 | Subagent | ✅ | agent.py spawn_subagent |
+| s07 | Skill Loading | ❌ | — |
+| s08 | Context Compact | ✅ | agent.py:340 snip+LLM summary |
+| s09 | Memory | ⚠️ | memory.py VectorMemory (无固化/遗忘) |
+| s10 | System Prompt | ✅ | agent.py load_system_prompt() |
+| s11 | Error Recovery | ⚠️ | tools.py:213 retry (无 fallback model) |
+| s19 | MCP | ✅ | agent.py:51 MCPClient |
+| s20 | Comprehensive | — | 目标 |
+
+**完成度：9/11（s07/s11 待做，s05/s09 部分实现）**
