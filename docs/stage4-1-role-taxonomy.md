@@ -1,5 +1,9 @@
-# Stage 4.1 — 角色与接口设计
+# Stage 4.1 — 角色与接口设计（teammate 生产构建预案）
 
+> ⚠️ **状态**：teammate 生产构建预案，**非 Stage 4 学习必需**。
+> Stage 4 学习走 small demo 路线，见 `learning-notes/stage4-多agent-概念学习.md` + team.py 现状跑通。
+> 本文档为未来若决定扩到 cat-cafe-grade 生产构建时的设计预案，**当前不实现**。
+>
 > 参照 cat-cafe（F032 Agent Plugin Architecture + F105 opencode 接入）+ Claude Code Subagents 文档。
 > 设计 teammate Stage 4 多 Agent 协作的角色 taxonomy、AgentBase I/O schema、停止条件。
 >
